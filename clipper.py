@@ -3,8 +3,8 @@
 import math,os,subprocess,argparse,time,hashlib
 
 verbose = False
-ffmpegDir = "INSERT_YOUR_FFMPEG_DIR"
-assert ffmpegDir != "INSERT_YOUR_FFMPEG_DIR"
+ffmpegDir = "ENTER_FFMPEG_DIR"
+assert ffmpegDir != "ENTER_FFMPEG_DIR"
 ffmpegPath = os.path.join(ffmpegDir,"ffmpeg.exe")
 ffprobePath = os.path.join(ffmpegDir,"ffprobe.exe")
 
@@ -334,11 +334,12 @@ class ScaleData:
 
 
 class ClipData:
-    def __init__(self,inFile,start,end,scale=None,fade=None,autofade=0.0,texts=None,subclips=None,audios=None,volume=1.0,lineNum=-1):
+    def __init__(self,inFile,start,end,format='.mp4',scale=None,fade=None,autofade=0.0,texts=None,subclips=None,audios=None,volume=1.0,lineNum=-1):
         if inFile:
             self.inFile = os.path.relpath(inFile)
         else:
             self.inFile = ''
+        self.format = format
         self.start = start
         self.end = end
         self.volume = volume
@@ -464,6 +465,7 @@ class ClipData:
         arr = [
             'clip',
             self.inFile,
+            self.format,
             str(round(self.start,3)),
             str(round(self.end,3)),
             str(round(self.volume,3)),
@@ -485,7 +487,7 @@ class ClipData:
         return ';'.join(arr)
     
     def GetName(self):
-        inFormat = os.path.splitext(self.inFile)[1]
+        inFormat = self.format
         hashS = self.GetStateString()
         
         enc = 'utf8'
@@ -657,7 +659,10 @@ def GenerateGenCmd(spec,clip,outNameOverride=''):
     cmd.append('-f')
     cmd.append('lavfi')
     cmd.append('-i')
-    cmd.append(f'anullsrc=channel_layout=stereo:sample_rate={spec.sampleRate}')
+    sampleRate = spec.sampleRate
+    if not sampleRate:
+        sampleRate = 44100
+    cmd.append(f'anullsrc=channel_layout=stereo:sample_rate={sampleRate}')
     cmd.extend(postfix)
     if clip.genType=='color':
         cmd.append('-shortest')
@@ -686,7 +691,7 @@ def GenerateCmd(spec,clip,outNameOverride=''):
     if outNameOverride:
         outPath = outNameOverride
         if clip.audios:
-            outPath = 'unmixed'+outPath
+            outPath = os.path.join(clipDir,'unmixed'+os.path.basename(outPath))
     else:
         if clip.audios:
             outPath = os.path.join(clipDir,'unmixed'+name)
@@ -1303,9 +1308,9 @@ def ParseAudio(parser,spec,currInFile):
             return None
     
     if audio.start is None:
-        start = 0.0
+        audio.start = 0.0
     if audio.end is None:
-        end = END_TIME_POS
+        audio.end = END_TIME_POS
     if audio.inFile is None:
         parser.PrintError('no audio input specified!')
         return None
@@ -1314,6 +1319,8 @@ def ParseAudio(parser,spec,currInFile):
 
 def ParseClip(parser,spec,currInFile,currAutoFade,top=False):
     clip = ClipData(currInFile,start=None,end=None)
+    if spec.outFile:
+        clip.format = os.path.splitext(spec.outFile)[1]
     clip.autoFade = currAutoFade
     
     clip.lineNum = parser.lineNum
@@ -1365,7 +1372,16 @@ def ParseClip(parser,spec,currInFile,currAutoFade,top=False):
             if len(toks)!=2:
                 parser.PrintError(f'expected 2 tokens, got {len(toks)}')
                 return None
+            if spec.outFile:
+                parser.PrintError(f'output file was set twice!')
+                return None
+                
             spec.outFile = os.path.join(baseDir,toks[1].strip())
+            clip.format = os.path.splitext(spec.outFile)[1]
+            if not clip.format:
+                parser.PrintError('output file has no extension!')
+                return None
+                
         elif parser.currLine.startswith('fps '):
             if not top:
                 parser.PrintError(f'can only set fps in global scope!')
@@ -1451,9 +1467,13 @@ def ParseClip(parser,spec,currInFile,currAutoFade,top=False):
                 parser.PrintError('could not parse audio!')
                 return None
             if clip.subClips and clip.end is not None:
-                audio.delay += endTime
+                audio.delay += clip.end
             clip.audios.append(audio)
         elif parser.currLine == 'clip' or parser.currLine == 'gen' or (parser.currLine.startswith('cut ') and top):
+            if not spec.outFile:
+                parser.PrintError('must set output file path!')
+                return None
+                
             startLine = parser.lineNum
             if parser.currLine == 'clip':
                 subclip = ParseClip(parser,spec,clip.inFile,clip.autoFade)
@@ -1483,6 +1503,7 @@ def ParseClip(parser,spec,currInFile,currAutoFade,top=False):
                     return None
                 
                 subclip = ClipData(clip.inFile,cut[0],cut[1],autofade=clip.autoFade,lineNum=parser.lineNum)
+                subclip.format = clip.format
                 clip.subClips.append(subclip)
                 
             clip.start = 0.0
@@ -1545,6 +1566,7 @@ def ParseClip(parser,spec,currInFile,currAutoFade,top=False):
             
             pendingXFadeClip = ClipData(clip.inFile,0.0,0.0)
             pendingXFadeClip.xfade = xFadeData
+            pendingXFadeClip.format = clip.format
             sub = clip.subClips.pop()
             pendingXFadeClip.subClips.append(sub)
             pendingXFadeClip.end = sub.GetLength()
@@ -1671,7 +1693,8 @@ def MakeGenClip(spec,clip,i,total):
 def MixInAudios(spec,clip):
     audioFilter = clip.GetAudioFilterString()
     if spec.clip is clip:
-        inFile = 'unmixed'+spec.outFile
+        basename = os.path.basename(spec.outFile)
+        inFile = os.path.join(clipDir,'unmixed'+basename)
         outFile = spec.outFile
     else:
         inFile = os.path.join(clipDir,'unmixed'+clip.GetName())
@@ -1699,10 +1722,11 @@ def MixInAudios(spec,clip):
         print(f'mixing error: ffmpeg exited with code {res.returncode}')
         return False
         
-    print('Reencoding...')
-    if not ReencodeVideo(os.path.basename(outFile)):
-        print(f'reencode error: ffmpeg could not reencode!')
-        return False
+    if clip is not spec.clip:
+        print('Reencoding...')
+        if not ReencodeVideo(os.path.basename(outFile)):
+            print(f'reencode error: ffmpeg could not reencode!')
+            return False
     return True
     
 
@@ -1755,10 +1779,10 @@ def MakeClip(spec,clip,i,total):
         # now concat
         if not ConcatClips(clip):
             return False
-    
-    if not os.path.isfile(clip.inFile):
-        print(f"Input video from line {clip.lineNum} named '{clip.inFile}' does not exist!")
-        return False
+    #else:
+        #if not os.path.isfile(clip.inFile):
+        #    print(f"Input video from line {clip.lineNum} named '{clip.inFile}' does not exist!")
+        #    return False
     
     outName = ''
     if spec.clip is clip:
